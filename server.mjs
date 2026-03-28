@@ -4,7 +4,8 @@ const port = Number(process.env.PORT || 8787);
 const apiKey = process.env.DOUBAO_API_KEY || "";
 const modelName = process.env.DOUBAO_MODEL || "doubao-seed-2-0-mini-260215";
 const doubaoEndpoint = process.env.DOUBAO_ENDPOINT || "https://ark.cn-beijing.volces.com/api/v3/responses";
-const promptStyles = ["standard", "compact", "strictCompact"];
+const promptStyles = ["standard", "compact"];
+const upstreamTimeoutMs = Number(process.env.DOUBAO_TIMEOUT_MS || 45000);
 
 function sendJSON(res, statusCode, payload) {
   res.writeHead(statusCode, {
@@ -258,30 +259,46 @@ function isValidSingleDayResult(raw, dayNumber) {
 }
 
 async function requestTripPlan(userInput, style, dayContext = null) {
-  const upstreamResponse = await fetch(doubaoEndpoint, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: modelName,
-      input: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: buildPrompt(userInput, style, dayContext),
-            },
-          ],
-        },
-      ],
-    }),
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), upstreamTimeoutMs);
 
-  const rawText = await upstreamResponse.text();
-  return { upstreamResponse, rawText };
+  try {
+    const upstreamResponse = await fetch(doubaoEndpoint, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: modelName,
+        input: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "input_text",
+                text: buildPrompt(userInput, style, dayContext),
+              },
+            ],
+          },
+        ],
+      }),
+      signal: controller.signal,
+    });
+
+    const rawText = await upstreamResponse.text();
+    return { upstreamResponse, rawText };
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      return {
+        upstreamResponse: { ok: false, status: 504 },
+        rawText: `Upstream request timed out after ${upstreamTimeoutMs}ms.`,
+      };
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function generateSingleDay(userInput, dayNumber, totalDays) {
