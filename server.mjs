@@ -4,6 +4,7 @@ const port = Number(process.env.PORT || 8787);
 const apiKey = process.env.DOUBAO_API_KEY || "";
 const modelName = process.env.DOUBAO_MODEL || "doubao-seed-2-0-mini-260215";
 const doubaoEndpoint = process.env.DOUBAO_ENDPOINT || "https://ark.cn-beijing.volces.com/api/v3/responses";
+const promptStyles = ["standard", "compact", "strictCompact"];
 
 function sendJSON(res, statusCode, payload) {
   res.writeHead(statusCode, {
@@ -15,7 +16,26 @@ function sendJSON(res, statusCode, payload) {
   res.end(JSON.stringify(payload));
 }
 
-function buildPrompt(userInput) {
+function buildPrompt(userInput, style = "standard") {
+  const extraInstruction =
+    style === "compact"
+      ? `
+
+补充限制：
+11. 如果内容较多，请优先缩短 detail 到 12-20 个字
+12. address 尽量控制在 12 个字以内
+13. 每天景点数量按游览和路程时长合理安排，通常 1-4 个`
+      : style === "strictCompact"
+        ? `
+
+严格压缩模式：
+11. 必须优先保证 JSON 完整，宁可内容更短
+12. detail 尽量控制在 10-16 个字
+13. address 尽量控制在 8-10 个字
+14. 每天景点数量按游览和路程时长合理安排，通常 1-3 个
+15. 如果输出即将过长，请减少描述字数，不要减少结尾括号`
+        : "";
+
   return `你是专业旅行规划师。
 
 请为用户生成旅行计划，并严格按照以下 JSON 格式输出，不要输出任何额外文字：
@@ -40,12 +60,15 @@ function buildPrompt(userInput) {
 要求：
 1. 使用中文
 2. 按天安排
-3. 每天只安排 3-5 个核心景点或地点，不要写酒店办理入住、休息、出发、返回、抵达机场车站等内容
+3. 每天安排的景点数量要根据景点游览时长和景点之间路程时长动态决定，可以是 1-5 个；不要为了凑数硬排满，也不要明显过空
 4. 不要输出具体几点几分，不需要 time 字段
-5. 每个景点都要有真实具体的游玩描述
+5. 每个景点都要有真实具体的游玩描述，但 detail 尽量控制在 18-30 个字，避免冗长
 6. 除了当天最后一个景点外，其余景点都要补充到下一个景点的路程和用时
-7. 如果是步行就写步行时间，如果较远可写打车或地铁的大致时间
-8. 只输出 JSON，不要输出任何解释文字
+7. 如果是步行就写步行时间，如果较远可写打车或地铁的大致时间；安排时要考虑这些路程时间是否合理
+8. address 只写简洁区域或简短地址，不要过长
+9. JSON 必须完整闭合，必须以完整的 `}` 结束；如果内容较多，请优先缩短 detail 和 address，也不要截断 JSON
+10. 只输出 JSON，不要输出任何解释文字
+${extraInstruction}
 
 用户需求：
 ${userInput}`;
@@ -86,6 +109,137 @@ async function readJSONBody(req) {
   return rawBody ? JSON.parse(rawBody) : {};
 }
 
+function sanitizedJSONString(raw) {
+  const extracted = extractJSONObject(raw) ?? raw;
+  return removeTrailingCommas(extracted);
+}
+
+function extractJSONObject(raw) {
+  const start = raw.indexOf("{");
+  if (start === -1) return null;
+
+  let depth = 0;
+  let isInsideString = false;
+  let isEscaping = false;
+
+  for (let index = start; index < raw.length; index += 1) {
+    const character = raw[index];
+
+    if (isEscaping) {
+      isEscaping = false;
+      continue;
+    }
+
+    if (character === "\\") {
+      isEscaping = true;
+      continue;
+    }
+
+    if (character === "\"") {
+      isInsideString = !isInsideString;
+      continue;
+    }
+
+    if (isInsideString) continue;
+
+    if (character === "{") depth += 1;
+    if (character === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return raw.slice(start, index + 1);
+      }
+    }
+  }
+
+  return null;
+}
+
+function removeTrailingCommas(raw) {
+  let result = "";
+  let isInsideString = false;
+  let isEscaping = false;
+
+  for (let index = 0; index < raw.length; index += 1) {
+    const character = raw[index];
+
+    if (isEscaping) {
+      result += character;
+      isEscaping = false;
+      continue;
+    }
+
+    if (character === "\\") {
+      result += character;
+      isEscaping = true;
+      continue;
+    }
+
+    if (character === "\"") {
+      isInsideString = !isInsideString;
+      result += character;
+      continue;
+    }
+
+    if (!isInsideString && character === ",") {
+      let lookahead = index + 1;
+      while (lookahead < raw.length && /\s/.test(raw[lookahead])) {
+        lookahead += 1;
+      }
+      if (lookahead < raw.length && (raw[lookahead] === "}" || raw[lookahead] === "]")) {
+        continue;
+      }
+    }
+
+    result += character;
+  }
+
+  return result;
+}
+
+function isCompleteTripJSON(raw) {
+  const sanitized = sanitizedJSONString(
+    raw.replace(/```json/g, "").replace(/```/g, "").trim()
+  );
+
+  if (!sanitized.startsWith("{") || !sanitized.endsWith("}")) {
+    return false;
+  }
+
+  try {
+    const parsed = JSON.parse(sanitized);
+    return Array.isArray(parsed?.days) && parsed.days.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+async function requestTripPlan(userInput, style) {
+  const upstreamResponse = await fetch(doubaoEndpoint, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: modelName,
+      input: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "input_text",
+              text: buildPrompt(userInput, style),
+            },
+          ],
+        },
+      ],
+    }),
+  });
+
+  const rawText = await upstreamResponse.text();
+  return { upstreamResponse, rawText };
+}
+
 async function handleGenerateTrip(req, res) {
   if (!apiKey) {
     sendJSON(res, 500, { error: "Server missing DOUBAO_API_KEY." });
@@ -106,53 +260,53 @@ async function handleGenerateTrip(req, res) {
     return;
   }
 
-  const upstreamResponse = await fetch(doubaoEndpoint, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      model: modelName,
-      input: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "input_text",
-              text: buildPrompt(userInput),
-            },
-          ],
-        },
-      ],
-    }),
+  let lastRawText = "";
+  let lastResult = "";
+
+  for (const style of promptStyles) {
+    const { upstreamResponse, rawText } = await requestTripPlan(userInput, style);
+    lastRawText = rawText;
+
+    if (!upstreamResponse.ok) {
+      if (style === promptStyles[promptStyles.length - 1]) {
+        sendJSON(res, upstreamResponse.status, { error: rawText || "Upstream request failed." });
+        return;
+      }
+      continue;
+    }
+
+    let upstreamJSON;
+    try {
+      upstreamJSON = JSON.parse(rawText);
+    } catch {
+      if (style === promptStyles[promptStyles.length - 1]) {
+        sendJSON(res, 502, { error: "Upstream returned non-JSON response.", raw: rawText });
+        return;
+      }
+      continue;
+    }
+
+    const result = extractText(upstreamJSON)
+      .replace(/```json/g, "")
+      .replace(/```/g, "")
+      .trim();
+    lastResult = result;
+
+    if (result && isCompleteTripJSON(result)) {
+      sendJSON(res, 200, { result: sanitizedJSONString(result) });
+      return;
+    }
+  }
+
+  if (!lastResult) {
+    sendJSON(res, 502, { error: "Upstream returned empty result.", raw: lastRawText });
+    return;
+  }
+
+  sendJSON(res, 502, {
+    error: "Upstream returned incomplete JSON after retries.",
+    raw: lastResult,
   });
-
-  const rawText = await upstreamResponse.text();
-  if (!upstreamResponse.ok) {
-    sendJSON(res, upstreamResponse.status, { error: rawText || "Upstream request failed." });
-    return;
-  }
-
-  let upstreamJSON;
-  try {
-    upstreamJSON = JSON.parse(rawText);
-  } catch {
-    sendJSON(res, 502, { error: "Upstream returned non-JSON response.", raw: rawText });
-    return;
-  }
-
-  const result = extractText(upstreamJSON)
-    .replace(/```json/g, "")
-    .replace(/```/g, "")
-    .trim();
-
-  if (!result) {
-    sendJSON(res, 502, { error: "Upstream returned empty result.", raw: rawText });
-    return;
-  }
-
-  sendJSON(res, 200, { result });
 }
 
 const server = http.createServer(async (req, res) => {
