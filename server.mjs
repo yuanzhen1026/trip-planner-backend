@@ -16,7 +16,7 @@ function sendJSON(res, statusCode, payload) {
   res.end(JSON.stringify(payload));
 }
 
-function buildPrompt(userInput, style = "standard") {
+function buildPrompt(userInput, style = "standard", dayContext = null) {
   const extraInstruction =
     style === "compact"
       ? `
@@ -35,6 +35,17 @@ function buildPrompt(userInput, style = "standard") {
 14. 每天景点数量按游览和路程时长合理安排，通常 1-3 个
 15. 如果输出即将过长，请减少描述字数，不要减少结尾括号`
         : "";
+
+  const dayInstruction = dayContext
+    ? `
+
+本次只生成其中一天：
+- 只生成第 ${dayContext.dayNumber} 天
+- 总天数是 ${dayContext.totalDays} 天
+- 这一天要和整趟旅行节奏一致，但只输出这一天的数据
+- 返回 JSON 时，days 数组里只能有 1 个 day 对象
+- 这个 day 的 title 必须以 "Day ${dayContext.dayNumber} ·" 开头`
+    : "";
 
   return `你是专业旅行规划师。
 
@@ -66,9 +77,10 @@ function buildPrompt(userInput, style = "standard") {
 6. 除了当天最后一个景点外，其余景点都要补充到下一个景点的路程和用时
 7. 如果是步行就写步行时间，如果较远可写打车或地铁的大致时间；安排时要考虑这些路程时间是否合理
 8. address 只写简洁区域或简短地址，不要过长
-9. JSON 必须完整闭合，必须以完整的 `}` 结束；如果内容较多，请优先缩短 detail 和 address，也不要截断 JSON
+9. JSON 必须完整闭合，必须以完整的 } 结束；如果内容较多，请优先缩短 detail 和 address，也不要截断 JSON
 10. 只输出 JSON，不要输出任何解释文字
 ${extraInstruction}
+${dayInstruction}
 
 用户需求：
 ${userInput}`;
@@ -213,7 +225,39 @@ function isCompleteTripJSON(raw) {
   }
 }
 
-async function requestTripPlan(userInput, style) {
+function extractTotalDays(userInput) {
+  const match = userInput.match(/天数：\s*(\d+)\s*天/);
+  const parsed = match ? Number(match[1]) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+}
+
+function parseTripDays(raw) {
+  const sanitized = sanitizedJSONString(
+    raw.replace(/```json/g, "").replace(/```/g, "").trim()
+  );
+  const parsed = JSON.parse(sanitized);
+  if (!Array.isArray(parsed?.days)) {
+    throw new Error("Missing days array.");
+  }
+  return parsed.days;
+}
+
+function isValidSingleDayResult(raw, dayNumber) {
+  if (!isCompleteTripJSON(raw)) {
+    return false;
+  }
+
+  try {
+    const days = parseTripDays(raw);
+    if (days.length !== 1) return false;
+    const title = typeof days[0]?.title === "string" ? days[0].title : "";
+    return title.startsWith(`Day ${dayNumber}`);
+  } catch {
+    return false;
+  }
+}
+
+async function requestTripPlan(userInput, style, dayContext = null) {
   const upstreamResponse = await fetch(doubaoEndpoint, {
     method: "POST",
     headers: {
@@ -228,7 +272,7 @@ async function requestTripPlan(userInput, style) {
           content: [
             {
               type: "input_text",
-              text: buildPrompt(userInput, style),
+              text: buildPrompt(userInput, style, dayContext),
             },
           ],
         },
@@ -238,6 +282,53 @@ async function requestTripPlan(userInput, style) {
 
   const rawText = await upstreamResponse.text();
   return { upstreamResponse, rawText };
+}
+
+async function generateSingleDay(userInput, dayNumber, totalDays) {
+  let lastRawText = "";
+  let lastResult = "";
+
+  for (const style of promptStyles) {
+    const { upstreamResponse, rawText } = await requestTripPlan(
+      userInput,
+      style,
+      { dayNumber, totalDays }
+    );
+    lastRawText = rawText;
+
+    if (!upstreamResponse.ok) {
+      if (style === promptStyles[promptStyles.length - 1]) {
+        throw new Error(rawText || `Failed to generate day ${dayNumber}.`);
+      }
+      continue;
+    }
+
+    let upstreamJSON;
+    try {
+      upstreamJSON = JSON.parse(rawText);
+    } catch {
+      if (style === promptStyles[promptStyles.length - 1]) {
+        throw new Error(`Upstream returned non-JSON response for day ${dayNumber}.`);
+      }
+      continue;
+    }
+
+    const result = extractText(upstreamJSON)
+      .replace(/```json/g, "")
+      .replace(/```/g, "")
+      .trim();
+    lastResult = result;
+
+    if (result && isValidSingleDayResult(result, dayNumber)) {
+      return parseTripDays(result)[0];
+    }
+  }
+
+  if (!lastResult) {
+    throw new Error(`Day ${dayNumber} returned empty result. Raw: ${lastRawText}`);
+  }
+
+  throw new Error(`Day ${dayNumber} returned incomplete JSON after retries. Raw: ${lastResult}`);
 }
 
 async function handleGenerateTrip(req, res) {
@@ -260,53 +351,23 @@ async function handleGenerateTrip(req, res) {
     return;
   }
 
-  let lastRawText = "";
-  let lastResult = "";
+  const totalDays = extractTotalDays(userInput);
 
-  for (const style of promptStyles) {
-    const { upstreamResponse, rawText } = await requestTripPlan(userInput, style);
-    lastRawText = rawText;
-
-    if (!upstreamResponse.ok) {
-      if (style === promptStyles[promptStyles.length - 1]) {
-        sendJSON(res, upstreamResponse.status, { error: rawText || "Upstream request failed." });
-        return;
-      }
-      continue;
+  try {
+    const days = [];
+    for (let dayNumber = 1; dayNumber <= totalDays; dayNumber += 1) {
+      const day = await generateSingleDay(userInput, dayNumber, totalDays);
+      days.push(day);
     }
 
-    let upstreamJSON;
-    try {
-      upstreamJSON = JSON.parse(rawText);
-    } catch {
-      if (style === promptStyles[promptStyles.length - 1]) {
-        sendJSON(res, 502, { error: "Upstream returned non-JSON response.", raw: rawText });
-        return;
-      }
-      continue;
-    }
-
-    const result = extractText(upstreamJSON)
-      .replace(/```json/g, "")
-      .replace(/```/g, "")
-      .trim();
-    lastResult = result;
-
-    if (result && isCompleteTripJSON(result)) {
-      sendJSON(res, 200, { result: sanitizedJSONString(result) });
-      return;
-    }
+    sendJSON(res, 200, {
+      result: JSON.stringify({ days }),
+    });
+  } catch (error) {
+    sendJSON(res, 502, {
+      error: error instanceof Error ? error.message : "Failed to generate complete itinerary.",
+    });
   }
-
-  if (!lastResult) {
-    sendJSON(res, 502, { error: "Upstream returned empty result.", raw: lastRawText });
-    return;
-  }
-
-  sendJSON(res, 502, {
-    error: "Upstream returned incomplete JSON after retries.",
-    raw: lastResult,
-  });
 }
 
 const server = http.createServer(async (req, res) => {
